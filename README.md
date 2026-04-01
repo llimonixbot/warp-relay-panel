@@ -16,10 +16,10 @@ Telegram Bot  ──HTTP──▶  Vercel (FastAPI)  ──HTTP──▶  Relay 
 
 | Компонент | Где | Стоимость |
 |-----------|-----|-----------|
-| API-панель | Vercel serverless | Бесплатно |
+| API-панель | Vercel serverless | Бесплатно (если соблюдать лимиты) |
 | База данных | Supabase PostgreSQL | Бесплатно (500 MB) |
-| Relay Agent | На каждом relay-сервере | Уже оплачен |
-| Telegram Bot | Твой сервер | Уже есть |
+| Relay Agent | На каждом relay-сервере | Платно |
+| Telegram Bot | Сервер | Платно |
 
 ## Быстрый старт
 
@@ -57,10 +57,10 @@ vercel --prod
 
 ```bash
 # Скопировать папку relay-agent на сервер
-scp -r relay-agent/ root@RELAY_IP:/tmp/relay-agent/
+scp -r relay-agent root@RELAY_IP:/tmp/
 
 # Запустить установку
-ssh root@RELAY_IP 'cd /tmp/relay-agent && bash setup_relay.sh'
+ssh root@RELAY_IP "bash /tmp/relay-agent/setup_relay.sh"
 
 # Скрипт спросит:
 #   Agent secret → тот же что в AGENT_SECRET на Vercel
