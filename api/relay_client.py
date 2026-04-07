@@ -114,12 +114,21 @@ async def remove_ip(ip: str) -> dict:
 
 async def full_sync(relay_id: int | None = None) -> dict:
     clients = db.list_clients(include_blocked=False)
+
+    # Собираем забаненные IP для фильтрации
+    banned_ips = {ban["ip"] for ban in db.list_ip_bans()}
+
     client_entries = []
+    skipped_banned = 0
     for c in clients:
         ip = c.get("current_ip")
         if ip:
             try:
                 ip = _validate_ipv4(ip)
+                if ip in banned_ips:
+                    skipped_banned += 1
+                    logger.info("Sync skip: client #%d IP %s is blacklisted", c["id"], ip)
+                    continue
                 client_entries.append({"ip": ip, "client_id": c["id"]})
             except ValueError:
                 logger.warning("Skipping non-IPv4: %s", ip)
@@ -141,7 +150,8 @@ async def full_sync(relay_id: int | None = None) -> dict:
         )
         db.mark_relay_synced(relay["id"], ok)
         results[relay["name"]] = {
-            "ok": ok, "ips_synced": len(client_entries) if ok else 0, **data,
+            "ok": ok, "ips_synced": len(client_entries) if ok else 0,
+            "skipped_banned": skipped_banned, **data,
         }
 
     await asyncio.gather(*[_sync(r) for r in relays], return_exceptions=True)
@@ -195,20 +205,15 @@ async def health_check_all() -> dict:
 
 
 # ═══════════════════════════════════════
-# UPDATE (fire-and-forget)
+# UPDATE
 # ═══════════════════════════════════════
 
 async def update_relay(relay: dict) -> dict:
-    """
-    Отправить команду обновления. Агент отвечает сразу (accepted/not).
-    Результат обновления → GET /health → last_update.
-    """
     ok, data = await _agent_request(relay, "POST", "/update")
     return {"relay": relay["name"], **data}
 
 
 async def update_all_relays() -> dict:
-    """Послать команду обновления на все активные relay."""
     relays = db.get_active_relays()
     if not relays:
         return {"error": "no_active_relays"}
