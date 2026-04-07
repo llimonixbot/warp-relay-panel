@@ -11,7 +11,6 @@ from . import database as db
 logger = logging.getLogger("relay_client")
 
 AGENT_TIMEOUT = 10.0
-UPDATE_TIMEOUT = 60.0  # обновление может занять время (git pull, pip)
 
 
 def _validate_ipv4(ip: str) -> str:
@@ -196,19 +195,20 @@ async def health_check_all() -> dict:
 
 
 # ═══════════════════════════════════════
-# UPDATE
+# UPDATE (fire-and-forget)
 # ═══════════════════════════════════════
 
 async def update_relay(relay: dict) -> dict:
-    """Отправить команду самообновления на один relay."""
-    ok, data = await _agent_request(
-        relay, "POST", "/update", timeout=UPDATE_TIMEOUT,
-    )
-    return {"ok": ok, "relay": relay["name"], **data}
+    """
+    Отправить команду обновления. Агент отвечает сразу (accepted/not).
+    Результат обновления → GET /health → last_update.
+    """
+    ok, data = await _agent_request(relay, "POST", "/update")
+    return {"relay": relay["name"], **data}
 
 
 async def update_all_relays() -> dict:
-    """Обновить все активные relay."""
+    """Послать команду обновления на все активные relay."""
     relays = db.get_active_relays()
     if not relays:
         return {"error": "no_active_relays"}

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 — ipset whitelist с refcount-защитой общих IP
-— трафик по IP (для админского анализа)
-— самообновление через /update
+— трафик по IP (conntrack accounting)
+— самообновление через /update (fire-and-forget)
 """
 
 import asyncio
@@ -13,7 +13,7 @@ import subprocess
 import time
 import logging
 from collections import defaultdict
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -30,12 +30,16 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/opt/warp-relay-agent"))
 REPO_DIR = Path(os.environ.get("REPO_DIR", "/opt/warp-relay-panel"))
 TRAFFIC_FILE = DATA_DIR / "traffic.json"
 REFCOUNT_FILE = DATA_DIR / "refcount.json"
+UPDATE_STATUS_FILE = DATA_DIR / "update_status.json"
 TRAFFIC_INTERVAL = int(os.environ.get("TRAFFIC_INTERVAL", "30"))
+
+# Часовой пояс для сброса трафика (МСК)
+MSK = timezone(timedelta(hours=3))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("agent")
 
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.2.1"
 app = FastAPI(title="WARP Relay Agent", version=AGENT_VERSION)
 
 
@@ -92,15 +96,15 @@ def _format_bytes(b: int) -> str:
     return f"{b:.1f} PB"
 
 
+def _now_msk() -> datetime:
+    return datetime.now(MSK)
+
+
 # ═══════════════════════════════════════
 # REFCOUNT MAP  (IP → {set of client_ids})
 # ═══════════════════════════════════════
 
 class RefCountMap:
-    """
-    IP → set(client_ids). Страховка от удаления общего IP.
-    """
-
     def __init__(self):
         self._map: dict[str, set[int]] = defaultdict(set)
         self._load()
@@ -125,7 +129,6 @@ class RefCountMap:
             logger.error("Could not save refcount: %s", e)
 
     def add(self, ip: str, client_id: int, old_ip: str | None = None) -> bool:
-        """Returns: True если old_ip можно безопасно удалить из ipset."""
         can_remove_old = False
         if old_ip and old_ip in self._map:
             self._map[old_ip].discard(client_id)
@@ -137,7 +140,6 @@ class RefCountMap:
         return can_remove_old
 
     def remove_client(self, ip: str, client_id: int | None = None) -> bool:
-        """Returns: True если IP можно безопасно удалить из ipset."""
         if ip not in self._map:
             return True
         if client_id is not None:
@@ -167,7 +169,7 @@ refcount = RefCountMap()
 
 
 # ═══════════════════════════════════════
-# TRAFFIC MONITOR (по IP)
+# TRAFFIC MONITOR (по IP, сброс по МСК)
 # ═══════════════════════════════════════
 
 class TrafficMonitor:
@@ -197,9 +199,9 @@ class TrafficMonitor:
 
     def _empty(self) -> dict:
         return {
-            "month": date.today().strftime("%Y-%m"),
+            "month": _now_msk().strftime("%Y-%m"),
             "ips": {},
-            "last_reset": datetime.now(timezone.utc).isoformat(),
+            "last_reset": _now_msk().isoformat(),
         }
 
     def _save(self):
@@ -210,9 +212,9 @@ class TrafficMonitor:
             logger.error("Could not save traffic data: %s", e)
 
     def _check_month_reset(self):
-        current_month = date.today().strftime("%Y-%m")
+        current_month = _now_msk().strftime("%Y-%m")
         if self.traffic.get("month") != current_month:
-            logger.info("Monthly reset: %s → %s",
+            logger.info("Monthly reset (MSK): %s → %s",
                         self.traffic.get("month", "?"), current_month)
             self.traffic = self._empty()
             self._last_conns.clear()
@@ -246,7 +248,7 @@ class TrafficMonitor:
     def collect(self):
         self._check_month_reset()
         current_conns, conn_ips = self._snapshot()
-        now = datetime.now(timezone.utc).isoformat()
+        now = _now_msk().isoformat()
         changed = False
         for key, (orig_bytes, reply_bytes) in current_conns.items():
             ip = conn_ips[key]
@@ -495,100 +497,139 @@ async def refcount_list():
 
 
 # ═══════════════════════════════════════
-# SELF-UPDATE
+# SELF-UPDATE (fire-and-forget)
 # ═══════════════════════════════════════
+
+def _load_update_status() -> dict | None:
+    try:
+        return json.loads(UPDATE_STATUS_FILE.read_text())
+    except Exception:
+        return None
+
+
+def _save_update_status(status: dict):
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        UPDATE_STATUS_FILE.write_text(json.dumps(status, indent=2))
+    except Exception as e:
+        logger.error("Could not save update status: %s", e)
+
+
+async def _do_update():
+    """Фоновая задача обновления. Результат пишется в update_status.json."""
+    repo = str(REPO_DIR)
+    install = str(DATA_DIR)
+    agent_src = f"{repo}/relay-agent"
+    started_at = _now_msk().isoformat()
+    steps = []
+
+    try:
+        # ── Git pull ──
+        code, stdout, stderr = _run(f"cd {repo} && git pull --ff-only 2>&1", timeout=30)
+        if code != 0:
+            code, stdout, stderr = _run(f"cd {repo} && git pull 2>&1", timeout=30)
+        if code != 0:
+            _save_update_status({
+                "ok": False, "error": "git pull failed",
+                "details": stdout or stderr, "started_at": started_at,
+                "finished_at": _now_msk().isoformat(),
+            })
+            return
+
+        no_changes = "Already up to date" in stdout or "Already up-to-date" in stdout
+        steps.append({"git_pull": "no changes" if no_changes else "updated"})
+
+        # Новая версия
+        new_version = AGENT_VERSION
+        try:
+            content = Path(f"{agent_src}/agent.py").read_text()
+            for line in content.split("\n"):
+                if "AGENT_VERSION" in line and "=" in line and not line.strip().startswith("#"):
+                    new_version = line.split("=")[1].strip().strip('"').strip("'")
+                    break
+        except Exception:
+            pass
+
+        # ── Копирование файлов ──
+        files_copied = []
+        for fname in ["agent.py", "ensure_rules.sh"]:
+            src = Path(f"{agent_src}/{fname}")
+            dst = Path(f"{install}/{fname}")
+            if src.exists():
+                try:
+                    _run(f"cp {src} {dst}")
+                    if fname.endswith(".sh"):
+                        _run(f"chmod +x {dst}")
+                    files_copied.append(fname)
+                except Exception as e:
+                    steps.append({"copy_error": f"{fname}: {e}"})
+        steps.append({"files_copied": files_copied})
+
+        # ── Pip deps ──
+        req_src = Path(f"{agent_src}/requirements.txt")
+        req_dst = Path(f"{install}/requirements.txt")
+        deps_updated = False
+        if req_src.exists():
+            try:
+                src_content = req_src.read_text()
+                dst_content = req_dst.read_text() if req_dst.exists() else ""
+                if src_content != dst_content:
+                    _run(f"cp {req_src} {req_dst}")
+                    _run(f"{install}/venv/bin/pip install -q -r {req_dst}", timeout=60)
+                    deps_updated = True
+            except Exception as e:
+                steps.append({"deps_error": str(e)})
+        steps.append({"deps_updated": deps_updated})
+
+        # ── Сохраняем результат ──
+        _save_update_status({
+            "ok": True,
+            "old_version": AGENT_VERSION,
+            "new_version": new_version,
+            "steps": steps,
+            "started_at": started_at,
+            "finished_at": _now_msk().isoformat(),
+        })
+
+        logger.info("Update complete: %s → %s, restarting...", AGENT_VERSION, new_version)
+
+        # ── Перезапуск (отложенный) ──
+        subprocess.Popen(
+            ["bash", "-c", "sleep 2 && systemctl restart warp-relay-agent"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    except Exception as e:
+        logger.error("Update failed: %s", e)
+        _save_update_status({
+            "ok": False, "error": str(e),
+            "started_at": started_at,
+            "finished_at": _now_msk().isoformat(),
+        })
+
 
 @app.post("/update")
 async def self_update():
     """
-    Самообновление агента:
-    1. git pull в REPO_DIR
-    2. Копирование файлов в INSTALL_DIR
-    3. Обновление pip-зависимостей (если изменились)
-    4. Отложенный перезапуск через systemd (2 сек)
+    Принимает запрос на обновление, запускает в фоне, отвечает сразу.
+    Результат обновления → GET /health → поле last_update.
     """
-    repo = str(REPO_DIR)
-    install = str(DATA_DIR)
-    agent_src = f"{repo}/relay-agent"
-    steps = []
-
-    # ── 1. Git pull ──
     if not (REPO_DIR / ".git").exists():
-        return {"ok": False, "error": f"Git repo not found at {repo}",
-                "hint": "Install via: git clone <repo> /opt/warp-relay-panel"}
+        return {
+            "accepted": False,
+            "error": f"Git repo not found at {REPO_DIR}",
+            "hint": "Install via: git clone <repo> /opt/warp-relay-panel",
+        }
 
-    code, stdout, stderr = _run(f"cd {repo} && git pull --ff-only 2>&1", timeout=30)
-    if code != 0:
-        # Попытка без --ff-only
-        code, stdout, stderr = _run(f"cd {repo} && git pull 2>&1", timeout=30)
-
-    if code != 0:
-        return {"ok": False, "error": "git pull failed", "details": stdout or stderr}
-
-    already_up_to_date = "Already up to date" in stdout or "Already up-to-date" in stdout
-    steps.append({"git_pull": "no changes" if already_up_to_date else "updated"})
-
-    # Читаем новую версию из agent.py
-    new_version = AGENT_VERSION
-    try:
-        content = Path(f"{agent_src}/agent.py").read_text()
-        for line in content.split("\n"):
-            if "AGENT_VERSION" in line and "=" in line:
-                new_version = line.split("=")[1].strip().strip('"').strip("'")
-                break
-    except Exception:
-        pass
-
-    # ── 2. Копирование файлов ──
-    files_copied = []
-    for fname in ["agent.py", "ensure_rules.sh"]:
-        src = Path(f"{agent_src}/{fname}")
-        dst = Path(f"{install}/{fname}")
-        if src.exists():
-            try:
-                _run(f"cp {src} {dst}")
-                if fname.endswith(".sh"):
-                    _run(f"chmod +x {dst}")
-                files_copied.append(fname)
-            except Exception as e:
-                steps.append({"copy_error": f"{fname}: {e}"})
-
-    steps.append({"files_copied": files_copied})
-
-    # ── 3. Pip deps ──
-    req_src = Path(f"{agent_src}/requirements.txt")
-    req_dst = Path(f"{install}/requirements.txt")
-    deps_updated = False
-    if req_src.exists():
-        try:
-            src_content = req_src.read_text()
-            dst_content = req_dst.read_text() if req_dst.exists() else ""
-            if src_content != dst_content:
-                _run(f"cp {req_src} {req_dst}")
-                _run(f"{install}/venv/bin/pip install -q -r {req_dst}", timeout=60)
-                deps_updated = True
-        except Exception as e:
-            steps.append({"deps_error": str(e)})
-
-    steps.append({"deps_updated": deps_updated})
-
-    # ── 4. Перезапуск (отложенный) ──
-    # Запускаем в фоне через 2 секунды — чтобы HTTP-ответ успел уйти
-    subprocess.Popen(
-        ["bash", "-c", "sleep 2 && systemctl restart warp-relay-agent"],
-        start_new_session=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    steps.append({"restart": "scheduled in 2s"})
-
-    logger.info("Self-update complete: %s → %s", AGENT_VERSION, new_version)
+    # Запускаем в фоне
+    asyncio.create_task(_do_update())
 
     return {
-        "ok": True,
-        "old_version": AGENT_VERSION,
-        "new_version": new_version,
-        "steps": steps,
+        "accepted": True,
+        "message": "Update started in background",
+        "check_status": "GET /health → last_update",
     }
 
 
@@ -614,9 +655,9 @@ async def health():
         ct_max = Path("/proc/sys/net/netfilter/nf_conntrack_max").read_text().strip()
     except Exception:
         pass
-    load = "0"
+    load_val = "0"
     try:
-        load = Path("/proc/loadavg").read_text().strip().split()[0]
+        load_val = Path("/proc/loadavg").read_text().strip().split()[0]
     except Exception:
         pass
     mem_total = mem_used = 0
@@ -631,7 +672,10 @@ async def health():
             mem_used = mem_total - mem_available
     except Exception:
         pass
+
     t = traffic_monitor.get_all()
+    update_status = _load_update_status()
+
     return {
         "status": "ok",
         "version": AGENT_VERSION,
@@ -639,11 +683,12 @@ async def health():
         "ip_forward": fwd == "1",
         "ipset_count": ipset_count,
         "conntrack": f"{ct_cur}/{ct_max}",
-        "load": float(load),
+        "load": float(load_val),
         "memory_mb": {"used": round(mem_used / 1024), "total": round(mem_total / 1024)},
         "traffic_month": t["month"],
         "traffic_total": t["total"],
         "traffic_ips": t["ip_count"],
+        "last_update": update_status,
     }
 
 
