@@ -2,6 +2,7 @@
 """
 — ipset whitelist с refcount-защитой общих IP
 — трафик по IP (conntrack accounting)
+— точный онлайн (ipset ∩ conntrack ASSURED)
 — самообновление через /update (fire-and-forget)
 """
 
@@ -89,10 +90,7 @@ def _run(cmd: str, check: bool = False, timeout: int = 10) -> tuple[int, str, st
 
 
 def _run_killgroup(cmd: str, timeout: int = 30) -> tuple[int, str, str]:
-    """
-    Запуск команды в отдельной process group.
-    При таймауте убивает ВСЮ группу (включая дочерние git-remote-https).
-    """
+    """Запуск с убийством всей process group при таймауте."""
     proc = subprocess.Popen(
         cmd, shell=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -102,7 +100,6 @@ def _run_killgroup(cmd: str, timeout: int = 30) -> tuple[int, str, str]:
         stdout, stderr = proc.communicate(timeout=timeout)
         return proc.returncode, stdout.strip(), stderr.strip()
     except subprocess.TimeoutExpired:
-        # Убиваем всю group — никаких зомби
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except ProcessLookupError:
@@ -121,6 +118,56 @@ def _format_bytes(b: int) -> str:
 
 def _now_msk() -> datetime:
     return datetime.now(MSK)
+
+
+def _get_ipset_members() -> set[str]:
+    """Получить все IP из ipset whitelist."""
+    code, stdout, _ = _run(f"ipset list {IPSET_NAME} 2>/dev/null")
+    if code != 0:
+        return set()
+    ips = set()
+    in_members = False
+    for line in stdout.split("\n"):
+        if line.startswith("Members:"):
+            in_members = True
+            continue
+        if in_members and line.strip():
+            ips.add(line.strip())
+    return ips
+
+
+def _get_conntrack_assured_ips() -> set[str]:
+    """Уникальные src IP с ASSURED UDP-сессиями (реально подключённые)."""
+    code, stdout, _ = _run(
+        "conntrack -L -p udp 2>/dev/null | grep ASSURED | "
+        "grep -oP '^.*?src=\\K[0-9.]+' | grep -v '^162\\.159\\.' | sort -u"
+    )
+    if code != 0 or not stdout:
+        return set()
+    return {ip for ip in stdout.split("\n") if ip.strip()}
+
+
+def _get_online_clients() -> dict:
+    """
+    Точный онлайн: пересечение ipset whitelist и conntrack ASSURED.
+    Только IP которые и разрешены, и реально имеют активные сессии.
+    """
+    whitelist = _get_ipset_members()
+    assured = _get_conntrack_assured_ips()
+    online_ips = whitelist & assured  # пересечение
+
+    # Добавляем client_ids из refcount для каждого онлайн IP
+    online = []
+    for ip in sorted(online_ips):
+        client_ids = sorted(refcount._map.get(ip, set()))
+        online.append({"ip": ip, "client_ids": client_ids})
+
+    return {
+        "count": len(online_ips),
+        "whitelist_total": len(whitelist),
+        "conntrack_assured": len(assured),
+        "clients": online,
+    }
 
 
 # ═══════════════════════════════════════
@@ -511,7 +558,7 @@ async def refcount_list():
 
 
 # ═══════════════════════════════════════
-# SELF-UPDATE (fire-and-forget, runs in thread)
+# SELF-UPDATE
 # ═══════════════════════════════════════
 
 def _load_update_status() -> dict | None:
@@ -530,24 +577,18 @@ def _save_update_status(status: dict):
 
 
 def _do_update_sync():
-    """
-    Синхронная функция обновления. Запускается в отдельном потоке
-    через run_in_executor, чтобы не блокировать event loop.
-    Использует _run_killgroup для git — убивает всю process group при таймауте.
-    """
+    """Синхронная функция обновления в отдельном потоке."""
     repo = str(REPO_DIR)
     install = str(DATA_DIR)
     agent_src = f"{repo}/relay-agent"
     started_at = _now_msk().isoformat()
 
     try:
-        # Чистим git lock если остался от предыдущего зависшего pull
         lock_file = REPO_DIR / ".git" / "index.lock"
         if lock_file.exists():
             lock_file.unlink()
             logger.warning("Removed stale git lock: %s", lock_file)
 
-        # ── Git pull (с убийством всей group при таймауте) ──
         code, stdout, stderr = _run_killgroup(
             f"cd {repo} && git pull --ff-only 2>&1", timeout=30,
         )
@@ -567,7 +608,6 @@ def _do_update_sync():
 
         no_changes = "Already up to date" in stdout or "Already up-to-date" in stdout
 
-        # Нет изменений → ничего не делаем
         if no_changes:
             _save_update_status({
                 "ok": True, "no_changes": True,
@@ -578,10 +618,8 @@ def _do_update_sync():
             logger.info("No updates available")
             return
 
-        # ── Есть изменения → обновляемся ──
         steps = [{"git_pull": "updated"}]
 
-        # Новая версия
         new_version = AGENT_VERSION
         try:
             content = Path(f"{agent_src}/agent.py").read_text()
@@ -592,7 +630,6 @@ def _do_update_sync():
         except Exception:
             pass
 
-        # Копирование файлов
         files_copied = []
         for fname in ["agent.py", "ensure_rules.sh"]:
             src = Path(f"{agent_src}/{fname}")
@@ -607,7 +644,6 @@ def _do_update_sync():
                     steps.append({"copy_error": f"{fname}: {e}"})
         steps.append({"files_copied": files_copied})
 
-        # Pip deps
         req_src = Path(f"{agent_src}/requirements.txt")
         req_dst = Path(f"{install}/requirements.txt")
         deps_updated = False
@@ -623,7 +659,6 @@ def _do_update_sync():
                 steps.append({"deps_error": str(e)})
         steps.append({"deps_updated": deps_updated})
 
-        # Результат
         _save_update_status({
             "ok": True,
             "old_version": AGENT_VERSION,
@@ -635,7 +670,6 @@ def _do_update_sync():
 
         logger.info("Update complete: %s → %s, restarting...", AGENT_VERSION, new_version)
 
-        # Перезапуск
         subprocess.Popen(
             ["bash", "-c", "sleep 2 && systemctl restart warp-relay-agent"],
             start_new_session=True,
@@ -654,20 +688,14 @@ def _do_update_sync():
 
 @app.post("/update")
 async def self_update():
-    """
-    Принимает запрос, отвечает мгновенно, обновление в отдельном потоке.
-    """
     if not (REPO_DIR / ".git").exists():
         return {
             "accepted": False,
             "error": f"Git repo not found at {REPO_DIR}",
             "hint": "Install via: git clone <repo> /opt/warp-relay-panel",
         }
-
-    # Запускаем в thread pool — НЕ блокирует event loop
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, _do_update_sync)
-
     return {
         "accepted": True,
         "message": "Update started in background",
@@ -714,14 +742,18 @@ async def health():
             mem_used = mem_total - mem_available
     except Exception:
         pass
+
     t = traffic_monitor.get_all()
+    online = _get_online_clients()
     update_status = _load_update_status()
+
     return {
         "status": "ok",
         "version": AGENT_VERSION,
         "uptime_seconds": int(time.time() - _START_TIME),
         "ip_forward": fwd == "1",
         "ipset_count": ipset_count,
+        "online_clients": online["count"],
         "conntrack": f"{ct_cur}/{ct_max}",
         "load": float(load_val),
         "memory_mb": {"used": round(mem_used / 1024), "total": round(mem_total / 1024)},
@@ -734,15 +766,13 @@ async def health():
 
 @app.get("/stats")
 async def stats():
-    code, stdout, _ = _run(
-        "conntrack -L -p udp 2>/dev/null | grep -oP '^.*?src=\\K[0-9.]+' | "
-        "grep -v '^162\\.159\\.' | sort -u"
-    )
-    unique_clients = [ip for ip in stdout.split("\n") if ip.strip()] if code == 0 else []
+    online = _get_online_clients()
+
     _, ct_data, _ = _run("conntrack -L -p udp 2>/dev/null | grep -v 'dport=22'")
     ct_lines = ct_data.split("\n") if ct_data else []
     assured = sum(1 for l in ct_lines if "ASSURED" in l)
     unreplied = sum(1 for l in ct_lines if "UNREPLIED" in l)
+
     _, ports_raw, _ = _run(
         "conntrack -L -p udp 2>/dev/null | grep -oP 'dport=\\K[0-9]+' | "
         "sort | uniq -c | sort -rn | head -10"
@@ -754,6 +784,7 @@ async def stats():
             parts = line.split()
             if len(parts) == 2:
                 top_ports[parts[1]] = int(parts[0])
+
     _, iface, _ = _run("ip route | awk '/default/ {print $5; exit}'")
     speed = {}
     if iface:
@@ -763,9 +794,9 @@ async def stats():
             speed = {"interface": iface, "rx_bytes_total": rx1, "tx_bytes_total": tx1}
         except Exception:
             pass
+
     return {
-        "unique_clients": len(unique_clients),
-        "client_ips": unique_clients,
+        "online": online,
         "sessions": {"assured": assured, "unreplied": unreplied},
         "top_ports": top_ports,
         "network": speed,
