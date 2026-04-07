@@ -36,8 +36,8 @@ from . import relay_client
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("panel")
 
-version = "1.2.0"
-app = FastAPI(title="WARP Relay Panel", version=version)
+API_VERSION = "1.2.1"
+app = FastAPI(title="WARP Relay Panel", version=API_VERSION)
 
 
 # ═══════════════════════════════════════
@@ -497,4 +497,4 @@ async def api_stats():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": version}
+    return {"status": "ok", "version": API_VERSION}

@@ -33,7 +33,6 @@ REFCOUNT_FILE = DATA_DIR / "refcount.json"
 UPDATE_STATUS_FILE = DATA_DIR / "update_status.json"
 TRAFFIC_INTERVAL = int(os.environ.get("TRAFFIC_INTERVAL", "30"))
 
-# Часовой пояс для сброса трафика (МСК)
 MSK = timezone(timedelta(hours=3))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -101,7 +100,7 @@ def _now_msk() -> datetime:
 
 
 # ═══════════════════════════════════════
-# REFCOUNT MAP  (IP → {set of client_ids})
+# REFCOUNT MAP
 # ═══════════════════════════════════════
 
 class RefCountMap:
@@ -169,7 +168,7 @@ refcount = RefCountMap()
 
 
 # ═══════════════════════════════════════
-# TRAFFIC MONITOR (по IP, сброс по МСК)
+# TRAFFIC MONITOR
 # ═══════════════════════════════════════
 
 class TrafficMonitor:
@@ -287,8 +286,7 @@ class TrafficMonitor:
                 "tx_bytes": tx, "rx_bytes": rx, "total_bytes": tx + rx,
                 "tx_human": _format_bytes(tx), "rx_human": _format_bytes(rx),
                 "total_human": _format_bytes(tx + rx),
-                "clients_on_ip": rc,
-                "updated": stats.get("updated"),
+                "clients_on_ip": rc, "updated": stats.get("updated"),
             }
         result["total_tx_bytes"] = total_tx
         result["total_rx_bytes"] = total_rx
@@ -379,7 +377,6 @@ async def whitelist_update(data: IPUpdateRequest):
         raise HTTPException(400, f"Invalid new_ip: {data.new_ip}")
     if data.old_ip and not _valid_ip(data.old_ip):
         raise HTTPException(400, f"Invalid old_ip: {data.old_ip}")
-
     removed = None
     if data.client_id is not None:
         can_remove = refcount.add(data.new_ip, data.client_id, data.old_ip)
@@ -394,9 +391,7 @@ async def whitelist_update(data: IPUpdateRequest):
             _run(f"ipset del {IPSET_NAME} {data.old_ip} 2>/dev/null")
             _run(f"conntrack -D -p udp -s {data.old_ip} 2>/dev/null")
             removed = data.old_ip
-
     _run(f"ipset add {IPSET_NAME} {data.new_ip} 2>/dev/null")
-
     return {
         "added": data.new_ip, "removed": removed,
         "client_id": data.client_id, "refcount": refcount.count(data.new_ip),
@@ -422,22 +417,17 @@ async def whitelist_remove(data: IPRequest):
 async def whitelist_sync(data: SyncRequest):
     valid_entries = [e for e in data.clients if _valid_ip(e.ip)]
     invalid = [e.ip for e in data.clients if not _valid_ip(e.ip)]
-
     _run(f"ipset create {IPSET_NAME} hash:ip 2>/dev/null")
     _run(f"ipset flush {IPSET_NAME}", check=True)
-
     unique_ips = set()
     rc_entries = []
     for entry in valid_entries:
         unique_ips.add(entry.ip)
         rc_entries.append((entry.ip, entry.client_id))
-
     for ip in unique_ips:
         _run(f"ipset add {IPSET_NAME} {ip}")
-
     refcount.set_all(rc_entries)
     _run("ipset save > /etc/ipset.rules 2>/dev/null")
-
     return {"synced": len(unique_ips), "clients": len(valid_entries), "invalid": invalid}
 
 
@@ -488,7 +478,7 @@ async def traffic_reset():
 
 
 # ═══════════════════════════════════════
-# REFCOUNT (отладка)
+# REFCOUNT
 # ═══════════════════════════════════════
 
 @app.get("/refcount")
@@ -516,12 +506,11 @@ def _save_update_status(status: dict):
 
 
 async def _do_update():
-    """Фоновая задача обновления. Результат пишется в update_status.json."""
+    """Фоновая задача обновления."""
     repo = str(REPO_DIR)
     install = str(DATA_DIR)
     agent_src = f"{repo}/relay-agent"
     started_at = _now_msk().isoformat()
-    steps = []
 
     try:
         # ── Git pull ──
@@ -531,13 +520,27 @@ async def _do_update():
         if code != 0:
             _save_update_status({
                 "ok": False, "error": "git pull failed",
-                "details": stdout or stderr, "started_at": started_at,
+                "details": stdout or stderr,
+                "started_at": started_at,
                 "finished_at": _now_msk().isoformat(),
             })
             return
 
         no_changes = "Already up to date" in stdout or "Already up-to-date" in stdout
-        steps.append({"git_pull": "no changes" if no_changes else "updated"})
+
+        # ── Нет изменений → ничего не делаем, не перезапускаем ──
+        if no_changes:
+            _save_update_status({
+                "ok": True, "no_changes": True,
+                "version": AGENT_VERSION,
+                "started_at": started_at,
+                "finished_at": _now_msk().isoformat(),
+            })
+            logger.info("No updates available")
+            return
+
+        # ── Есть изменения → обновляемся ──
+        steps = [{"git_pull": "updated"}]
 
         # Новая версия
         new_version = AGENT_VERSION
@@ -550,7 +553,7 @@ async def _do_update():
         except Exception:
             pass
 
-        # ── Копирование файлов ──
+        # Копирование файлов
         files_copied = []
         for fname in ["agent.py", "ensure_rules.sh"]:
             src = Path(f"{agent_src}/{fname}")
@@ -565,7 +568,7 @@ async def _do_update():
                     steps.append({"copy_error": f"{fname}: {e}"})
         steps.append({"files_copied": files_copied})
 
-        # ── Pip deps ──
+        # Pip deps
         req_src = Path(f"{agent_src}/requirements.txt")
         req_dst = Path(f"{install}/requirements.txt")
         deps_updated = False
@@ -581,7 +584,7 @@ async def _do_update():
                 steps.append({"deps_error": str(e)})
         steps.append({"deps_updated": deps_updated})
 
-        # ── Сохраняем результат ──
+        # Сохраняем результат
         _save_update_status({
             "ok": True,
             "old_version": AGENT_VERSION,
@@ -593,7 +596,7 @@ async def _do_update():
 
         logger.info("Update complete: %s → %s, restarting...", AGENT_VERSION, new_version)
 
-        # ── Перезапуск (отложенный) ──
+        # Перезапуск
         subprocess.Popen(
             ["bash", "-c", "sleep 2 && systemctl restart warp-relay-agent"],
             start_new_session=True,
@@ -612,20 +615,13 @@ async def _do_update():
 
 @app.post("/update")
 async def self_update():
-    """
-    Принимает запрос на обновление, запускает в фоне, отвечает сразу.
-    Результат обновления → GET /health → поле last_update.
-    """
     if not (REPO_DIR / ".git").exists():
         return {
             "accepted": False,
             "error": f"Git repo not found at {REPO_DIR}",
             "hint": "Install via: git clone <repo> /opt/warp-relay-panel",
         }
-
-    # Запускаем в фоне
     asyncio.create_task(_do_update())
-
     return {
         "accepted": True,
         "message": "Update started in background",
@@ -672,10 +668,8 @@ async def health():
             mem_used = mem_total - mem_available
     except Exception:
         pass
-
     t = traffic_monitor.get_all()
     update_status = _load_update_status()
-
     return {
         "status": "ok",
         "version": AGENT_VERSION,
