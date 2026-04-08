@@ -4,6 +4,7 @@
 
 Защищённые (X-API-Key):
   POST/GET/DELETE  /api/clients
+  POST             /api/clients/{id}/activate  — ручная активация по IP
   POST/GET/DELETE  /api/relays
   POST/GET/DELETE  /api/blacklist
   POST             /api/relays/sync-all
@@ -24,7 +25,8 @@ from pydantic import BaseModel
 
 from .database import (
     create_client_record, get_client_by_token, get_client_by_id,
-    list_clients, activate_client, block_client, delete_client,
+    list_clients, activate_client, activate_client_by_id,
+    block_client, delete_client,
     get_activation_logs, get_all_active_ips,
     count_clients_on_ip,
     add_relay, list_relays, get_active_relays, delete_relay, toggle_relay,
@@ -79,6 +81,9 @@ class ClientCreate(BaseModel):
 
 class ClientBlock(BaseModel):
     blocked: bool = True
+
+class ClientManualActivate(BaseModel):
+    ip: str
 
 class RelayCreate(BaseModel):
     name: str
@@ -186,6 +191,16 @@ ERROR_MAP = {
     "invalid_ip": ("Ошибка определения IP", "Не удалось определить ваш IPv4 адрес."),
 }
 
+# Человекочитаемые ошибки для API-ответов (бот)
+API_ERROR_MESSAGES = {
+    "client_not_found": "Клиент не найден",
+    "blocked": "Ваш аккаунт заблокирован",
+    "ip_banned": "Этот IP-адрес заблокирован",
+    "daily_limit": "Превышен лимит активаций на сегодня",
+    "invalid_ip": "Некорректный IP-адрес",
+    "ipv6_not_supported": "IPv6 не поддерживается, нужен IPv4",
+}
+
 
 def _error_html(key: str, status: int = 403) -> HTMLResponse:
     title, message = ERROR_MAP.get(key, ("Ошибка", key))
@@ -248,8 +263,6 @@ async def activate(token: str, request: Request):
 
     if result["status"] == "already_active":
         # Re-push IP на relay (идемпотентно).
-        # Покрывает кейс: IP был удалён с relay после бана/разбана,
-        # но в базе по-прежнему числится как текущий.
         await relay_client.add_ip(client_ip, client_id=result["client_id"])
         return HTMLResponse(TMPL_SAME.format(style=_BASE_STYLE, ip=client_ip))
 
@@ -314,6 +327,69 @@ async def api_client_traffic(client_id: int):
     results = await relay_client.get_traffic_all_relays(client["current_ip"])
     return {"client_id": client_id, "label": client["label"],
             "ip": client["current_ip"], "relays": results}
+
+
+@app.post("/api/clients/{client_id}/activate", dependencies=[Depends(require_api_key)])
+async def api_activate_client_manual(client_id: int, data: ClientManualActivate):
+    """Ручная активация клиента по IP (вызывается ботом)."""
+    ip = data.ip.strip()
+
+    # Валидация IP
+    try:
+        addr = ipaddress.ip_address(ip)
+        if isinstance(addr, ipaddress.IPv6Address):
+            if addr.ipv4_mapped:
+                ip = str(addr.ipv4_mapped)
+            else:
+                return {"error": "ipv6_not_supported",
+                        "detail": API_ERROR_MESSAGES["ipv6_not_supported"]}
+    except ValueError:
+        return {"error": "invalid_ip",
+                "detail": API_ERROR_MESSAGES["invalid_ip"]}
+
+    # Активация в БД
+    result = activate_client_by_id(client_id, ip)
+
+    if "error" in result:
+        error_key = result["error"]
+        detail = API_ERROR_MESSAGES.get(error_key, error_key)
+        if error_key == "ip_banned" and result.get("reason"):
+            detail += f": {result['reason']}"
+        return {"error": error_key, "detail": detail}
+
+    # Если IP уже тот же — re-push на relay
+    if result["status"] == "already_active":
+        await relay_client.add_ip(ip, client_id=result["client_id"])
+        logger.info("Manual activate (same IP): client #%d ip=%s", client_id, ip)
+        return {
+            "status": "already_active",
+            "client_id": client_id,
+            "ip": ip,
+        }
+
+    # Новый IP — синхронизация с relay
+    old_ip = result.get("old_ip")
+    new_ip = result["new_ip"]
+
+    if result.get("old_ip_shared"):
+        logger.info("Manual activate: client #%d %s → %s (old IP shared, keeping)",
+                     client_id, old_ip, new_ip)
+        old_ip = None
+    else:
+        logger.info("Manual activate: client #%d %s → %s",
+                     client_id, old_ip or "new", new_ip)
+
+    relay_results = await relay_client.add_ip(new_ip, old_ip, client_id=client_id)
+    logger.info("Manual activate relay sync: %s", relay_results)
+
+    return {
+        "status": "activated",
+        "client_id": client_id,
+        "ip": new_ip,
+        "old_ip": result.get("old_ip"),
+        "relay_sync": relay_results,
+    }
+
 
 @app.patch("/api/clients/{client_id}/block", dependencies=[Depends(require_api_key)])
 async def api_block_client(client_id: int, data: ClientBlock):

@@ -140,6 +140,65 @@ def activate_client(token: str, new_ip: str, user_agent: str = "") -> dict:
     }
 
 
+def activate_client_by_id(client_id: int, new_ip: str) -> dict:
+    """Ручная активация по client_id и IP (вызывается ботом через API)."""
+    client = get_client_by_id(client_id)
+    if not client:
+        return {"error": "client_not_found"}
+    if client["is_blocked"]:
+        return {"error": "blocked"}
+
+    # Проверка IP-бана
+    ban = get_ip_ban(new_ip)
+    if ban:
+        return {"error": "ip_banned", "reason": ban["reason"]}
+
+    max_act = int(os.environ.get("MAX_ACTIVATIONS_PER_DAY", "10"))
+    today = date.today().isoformat()
+
+    activations_today = client["_activations_today"]
+    if client["_reset_date"] != today:
+        activations_today = 0
+
+    if max_act > 0 and activations_today >= max_act:
+        return {"error": "daily_limit"}
+
+    old_ip = client["current_ip"]
+
+    if old_ip == new_ip:
+        return {"status": "already_active", "client_id": client["id"], "new_ip": new_ip}
+
+    old_ip_shared = False
+    if old_ip:
+        others = count_clients_on_ip(old_ip, exclude_client_id=client["id"])
+        old_ip_shared = others > 0
+
+    now = datetime.now(timezone.utc).isoformat()
+    update_data = {
+        "previous_ip_enc": client["_raw_current_ip_enc"],
+        "current_ip_enc": encrypt_ip(new_ip),
+        "current_ip_hash": hash_ip(new_ip),
+        "last_activated_at": now,
+        "activations_today": activations_today + 1,
+        "activations_reset_date": today,
+    }
+    _db().table("clients").update(update_data).eq("id", client["id"]).execute()
+
+    _db().table("activation_log").insert({
+        "client_id": client["id"],
+        "ip_enc": encrypt_ip(new_ip),
+        "user_agent": "manual_bot_activation",
+    }).execute()
+
+    return {
+        "status": "activated",
+        "client_id": client["id"],
+        "old_ip": old_ip,
+        "new_ip": new_ip,
+        "old_ip_shared": old_ip_shared,
+    }
+
+
 def block_client(client_id: int, blocked: bool = True):
     _db().table("clients").update({"is_blocked": blocked}).eq("id", client_id).execute()
 
